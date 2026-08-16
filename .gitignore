@@ -1,0 +1,16 @@
+config.ini
+*.local.ini
+*.log
+*.out
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+
+# BearWare's separately licensed SDK must not be committed.
+TeamTalk5.py
+TeamTalk5.dll
+libTeamTalk5.so
+libTeamTalk5.dylib
+teamtalk-sdk/
