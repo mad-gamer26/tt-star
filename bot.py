@@ -582,6 +582,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         self.user_voices: dict[str, str] = {}
         self.user_rates: dict[str, str] = {}
         self.user_pitches: dict[str, str] = {}
+        self.users_announcing_names: set[str] = set()
         self.user_last_results: dict[str, list[str]] = {}
         self.text_parts: dict[tuple[int, int, int], list[tt.TextMessage]] = {}
         self.media_queue: queue.Queue[tuple[Path, int, str]] = queue.Queue()
@@ -705,6 +706,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             f"{p}voice <name or number> - choose your voice\n"
             "/rate <number|none> - set or clear your speech rate\n"
             "/pitch <number|none> - set or clear your speech pitch\n"
+            f"{p}names - toggle announcing your name before your messages\n"
             f"{p}preview [voice] - speak the configured preview text\n"
             f"{p}current - show your chosen voice\n"
             f"{p}status - show bot status\n"
@@ -846,6 +848,8 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             self._set_user_numeric_setting(user_id, rest, self.user_rates, "rate")
         elif command == "pitch":
             self._set_user_numeric_setting(user_id, rest, self.user_pitches, "pitch")
+        elif command == "names":
+            self._toggle_name_announcements(user_id)
         elif command == "preview":
             voice = rest or self._current_voice(user_id)
             if not voice:
@@ -882,7 +886,17 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         rate = self.user_rates.get(user_key, "none")
         pitch = self.user_pitches.get(user_key, "none")
         voice_text = voice if voice else "none"
-        return f"Current voice: {voice_text}. Rate: {rate}. Pitch: {pitch}."
+        names = "on" if user_key in self.users_announcing_names else "off"
+        return f"Current voice: {voice_text}. Rate: {rate}. Pitch: {pitch}. Names: {names}."
+
+    def _toggle_name_announcements(self, user_id: int) -> None:
+        user_key = self._user_key(user_id)
+        if user_key in self.users_announcing_names:
+            self.users_announcing_names.discard(user_key)
+            self._reply(user_id, "Name announcements off. Your messages will be spoken without your name.")
+        else:
+            self.users_announcing_names.add(user_key)
+            self._reply(user_id, "Name announcements on. Your messages will start with your name.")
 
     def _set_user_numeric_setting(
         self,
@@ -999,8 +1013,9 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
                 f"Use {self.bot_settings.command_prefix}voices to list voices.",
             )
             return
-        speaker = self._user_display_name(user_id)
-        self._request_synthesis(user_id, voice, f"{speaker} said, {text}")
+        if self._user_key(user_id) in self.users_announcing_names:
+            text = f"{self._user_display_name(user_id)} said, {text}"
+        self._request_synthesis(user_id, voice, text)
 
     def _request_synthesis(self, user_id: int, voice: str, text: str) -> None:
         if not self._require_user_in_bot_channel(user_id):
