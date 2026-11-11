@@ -856,7 +856,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             f"{p}voice <name or number> - choose your voice\n"
             "/rate <number|none> - set or clear your speech rate\n"
             "/pitch <number|none> - set or clear your speech pitch\n"
-            f"{p}names - toggle announcing your name before your messages\n"
+            f"{p}name - toggle announcing your name before your messages\n"
             f"{p}preview [voice] - speak the configured preview text\n"
             f"{p}current - show your chosen voice\n"
             f"{p}status - show bot status\n"
@@ -1006,7 +1006,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             self._set_user_numeric_setting(user_id, rest, self.user_rates, "rate")
         elif command == "pitch":
             self._set_user_numeric_setting(user_id, rest, self.user_pitches, "pitch")
-        elif command == "names":
+        elif command == "name":
             self._toggle_name_announcements(user_id)
         elif command == "preview":
             voice = rest or self._current_voice(user_id)
@@ -1055,7 +1055,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         pitch = self.user_pitches.get(user_key, "none")
         voice_text = voice if voice else "none"
         names = "on" if user_key in self.users_announcing_names else "off"
-        return f"Current voice: {voice_text}. Rate: {rate}. Pitch: {pitch}. Names: {names}."
+        return f"Current voice: {voice_text}. Rate: {rate}. Pitch: {pitch}. Name: {names}."
 
     def _toggle_name_announcements(self, user_id: int) -> None:
         user_key = self._user_key(user_id)

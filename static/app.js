@@ -742,7 +742,7 @@ async function showServer(name) {
   peopleRefresh.addEventListener("click", () => loadPeople(true));
   const peopleSection = el("section", { "aria-labelledby": "h-people" },
     el("h2", { id: "h-people", text: "People's choices" }),
-    el("p", { class: "help", text: "What people chose with the voice, rate, pitch and names commands on this server. The bot forgets these when it reconnects to the server." }),
+    el("p", { class: "help", text: "What people chose with the voice, rate, pitch and name commands on this server. The bot forgets these when it reconnects to the server." }),
     peopleRefresh, peopleHolder);
   const notRunning = el("p", { class: "state-note", text: "Say something and people's choices appear while the bot is connected to this server." });
 
