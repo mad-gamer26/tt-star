@@ -132,7 +132,7 @@ class Person(tt.TeamTalk, threading.Thread):
 
     def onConnectSuccess(self):
         # A sound output (TeamTalk's virtual one), so the client receives
-        # the bot's media stream and reports it in the bot's user state.
+        # the bot's voice stream and reports it in the bot's user state.
         self.initSoundOutputDevice(tt.TT_SOUNDDEVICE_ID_TEAMTALK_VIRTUAL)
         self.doLogin(tt.ttstr("Tester"), tt.ttstr(USER), tt.ttstr(PASSWORD), tt.ttstr("live test"))
 
@@ -150,7 +150,8 @@ class Person(tt.TeamTalk, threading.Thread):
             self.messages.append(str(tt.ttstr(message.szMessage)))
 
     def onUserStateChange(self, user):
-        streaming = bool(user.uUserState & tt.UserState.USERSTATE_MEDIAFILE_AUDIO)
+        # Speech is the bot's voice stream (TT_InsertAudioBlock).
+        streaming = bool(user.uUserState & tt.UserState.USERSTATE_VOICE)
         if streaming and not self.streaming:
             self.saw_stream = True
         self.streaming = streaming
@@ -354,7 +355,7 @@ def main() -> int:
         check("...still the same process for startman", bot.poll() is None and bot.pid == pid)
         check("...both servers reconnect", wait_for(
             lambda: all(s["state"] == "connected" for s in state()["servers"]), 30), state())
-    except Exception as exc:
+    except Exception:
         import traceback
         check("the test ran to the end", False, traceback.format_exc())
     finally:

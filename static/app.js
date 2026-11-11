@@ -971,10 +971,9 @@ async function showSettings() {
         choices: [{ value: "", label: "None (people must choose one)" }].concat(voices.voices.map((voice) => ({ value: voice, label: voice }))) },
       { path: "bot.voice_preview_text", label: "Preview text", kind: "text", help: "What preview says. {voice} becomes the voice's name." },
       { path: "bot.max_voice_results", label: "Voices listed in one reply", kind: "int", min: 1 },
-      { path: "bot.temp_dir", label: "Folder for speech files", kind: "text", help: "Where speech is kept while it plays. Leave empty for the system's temporary folder." },
+      { path: "bot.temp_dir", label: "Folder for speech files", kind: "text", help: "Used only for the rare synthesized file that cannot be decoded as it arrives; it is deleted right after. Leave empty for the system's temporary folder." },
     ] },
     { path: "teamtalk", title: "TeamTalk", description: "", fields: [
-      { path: "teamtalk.client_name", label: "Client name", kind: "text", help: "What the bot reports as its TeamTalk client. Used the next time each server logs in." },
       { path: "teamtalk.reconnect_seconds", label: "Seconds between reconnection attempts", kind: "float", min: 1 },
       { path: "teamtalk.license_name", label: "SDK license name", kind: "text", help: "Only if your TeamTalk SDK needs a license. Takes effect when the bot restarts." },
       { path: "teamtalk.license_key", label: "SDK license key", kind: "password" },

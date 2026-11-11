@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import ctypes
 import inspect
 import itertools
 import json
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import subprocess
 import sys
 import tempfile
 import threading
@@ -48,11 +50,66 @@ tt = load_teamtalk_sdk()
 USER_REVISION = 4
 DEFAULT_CONFIG = SCRIPT_DIR / "config.ini"
 EXIT_RESTART = 75
-DONE_MEDIA_STATUSES = {
-    tt.MediaFileStatus.MFS_FINISHED,
-    tt.MediaFileStatus.MFS_ERROR,
-    tt.MediaFileStatus.MFS_ABORTED,
-}
+# What the bot reports as its TeamTalk client (not configurable).
+CLIENT_NAME = "STAR TeamTalk Bot"
+
+# Speech is sent as the bot's voice stream with TT_InsertAudioBlock: decoded
+# to 16-bit PCM in the channel codec's format and given to TeamTalk in pieces
+# of AUDIO_CHUNK_MSEC. TeamTalk sends it in real time and reports how much it
+# has sent (uElapsedMSec of CLIENTEVENT_AUDIOINPUT, about every 40 ms); the
+# bot keeps AUDIO_AHEAD_MSEC more than that inserted. (uQueueMSec is only
+# TeamTalk's current frame, not this backlog.) TeamTalk cannot drop what it
+# has queued, so the backlog is what still plays after Stop; it holds about
+# 3 s at most.
+AUDIO_CHUNK_MSEC = 100
+AUDIO_AHEAD_MSEC = 500
+# Silence after each message: the codec keeps a little of what it last
+# encoded, and without this it came out as a faint blip (about -40 dB) at the
+# start of the next message, and the last few milliseconds were held back.
+SPEECH_TAIL_MSEC = 100
+# Longest speech kept for one message (at 48 kHz stereo about 92 MB).
+MAX_SPEECH_SECONDS = 480
+
+
+@dataclass
+class Speech:
+    """One decoded message waiting to be spoken."""
+
+    pcm: bytes
+    sample_rate: int
+    channels: int
+    requester_id: int
+    description: str
+
+    @property
+    def frame_bytes(self) -> int:
+        return 2 * self.channels
+
+    @property
+    def seconds(self) -> float:
+        return len(self.pcm) / self.frame_bytes / self.sample_rate
+
+
+def decode_audio(audio: bytes, extension: str, sample_rate: int, channels: int, temp_dir: str = "") -> bytes:
+    """Decodes a synthesized file (wav, mp3, ogg...) to 16-bit little-endian
+    PCM with ffmpeg. Reads it from a pipe; formats that need seeking are
+    written to a temporary file first."""
+    output = ["-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(sample_rate), "-ac", str(channels),
+              "-t", str(MAX_SPEECH_SECONDS), "pipe:1"]
+    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    result = subprocess.run(base + ["-i", "pipe:0"] + output, input=audio, capture_output=True, timeout=60)
+    if result.returncode == 0 and result.stdout:
+        return result.stdout
+    extension = "".join(char for char in extension.lower() if char.isalnum()) or "wav"
+    if temp_dir:
+        Path(temp_dir).mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix="star_tt_", suffix=f".{extension}", dir=temp_dir or None) as fp:
+        fp.write(audio)
+        fp.flush()
+        result = subprocess.run(base + ["-i", fp.name] + output, capture_output=True, timeout=60)
+    if result.returncode != 0 or not result.stdout:
+        raise RuntimeError((result.stderr.decode(errors="replace").strip() or "no audio").splitlines()[-1])
+    return result.stdout
 
 
 def connect_star_websocket(uri: str):
@@ -177,7 +234,6 @@ class BotSettings:
 
 @dataclass
 class TeamTalkGlobalSettings:
-    client_name: str = "STAR TeamTalk Bot"
     reconnect_seconds: float = 5.0
     license_name: str = ""
     license_key: str = ""
@@ -243,7 +299,6 @@ def read_config(path: Path) -> AppConfig:
         temp_dir=bot_section.get("temp_dir", ""),
     )
     teamtalk = TeamTalkGlobalSettings(
-        client_name=tt_section.get("client_name", "STAR TeamTalk Bot"),
         reconnect_seconds=float(tt_section.get("reconnect_seconds", "5")),
         license_name=tt_section.get("license_name", ""),
         license_key=tt_section.get("license_key", ""),
@@ -296,7 +351,6 @@ def write_config(path: Path, config: AppConfig) -> None:
         "temp_dir": config.bot.temp_dir,
     }
     parser["teamtalk"] = {
-        "client_name": config.teamtalk.client_name,
         "reconnect_seconds": str(config.teamtalk.reconnect_seconds),
         "license_name": config.teamtalk.license_name,
         "license_key": config.teamtalk.license_key,
@@ -357,10 +411,9 @@ def configure(path: Path) -> None:
         default_voice=prompt("Default voice for users without a selection", existing.bot.default_voice),
         voice_preview_text=prompt("Voice preview text", existing.bot.voice_preview_text),
         max_voice_results=prompt_int("Maximum voices to list in one reply", existing.bot.max_voice_results, minimum=1),
-        temp_dir=prompt("Temp directory for synthesized audio files", existing.bot.temp_dir),
+        temp_dir=prompt("Temp directory for synthesized audio that must be decoded from a file", existing.bot.temp_dir),
     )
     teamtalk = TeamTalkGlobalSettings(
-        client_name=prompt("TeamTalk client name", existing.teamtalk.client_name),
         reconnect_seconds=prompt_int("Reconnect delay in seconds", int(existing.teamtalk.reconnect_seconds), minimum=1),
         license_name=prompt("TeamTalk SDK license name, if required", existing.teamtalk.license_name),
         license_key=prompt("TeamTalk SDK license key, if required", existing.teamtalk.license_key),
@@ -621,8 +674,20 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         self.users_announcing_names: set[str] = set()
         self.user_last_results: dict[str, list[str]] = {}
         self.text_parts: dict[tuple[int, int, int], list[tt.TextMessage]] = {}
-        self.media_queue: queue.Queue[tuple[Path, int, str]] = queue.Queue()
-        self.current_media: tuple[Path, int, str] | None = None
+        self.media_queue: queue.Queue[Speech] = queue.Queue()
+        self.current_media: Speech | None = None
+        # The audio input session of current_media (TT_InsertAudioBlock).
+        self._stream_ids = itertools.count(1)
+        self._stream_id = 0
+        self._sent_bytes = 0
+        self._flushed = False
+        self._elapsed_msec = 0
+        self._speech_deadline = 0.0
+        # Decoded one at a time, in the order the speech arrived.
+        self._decode_queue: queue.Queue = queue.Queue()
+        self._decoder: threading.Thread | None = None
+        # The channel codec's sample rate and channels (speech is decoded to it).
+        self.audio_format = (48000, 1)
         self.pending_channel_join = False
         self.logged_in = False
         self.in_channel = False
@@ -657,6 +722,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
                 while not self.stop_event.is_set() and not self.reconnect_now:
                     self._drain_actions()
                     self.runEventLoop(100)
+                    self._check_speech_deadline()
                 self._shutdown_streaming()
                 self.disconnect()
             except Exception:
@@ -700,7 +766,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             "channel_path": "",
             "others": [],
             "queue": self.media_queue.qsize(),
-            "speaking": self.current_media[2] if self.current_media else "",
+            "speaking": self.current_media.description if self.current_media else "",
         }
         if self.logged_in and self.current_channel_id > 0:
             info["channel_path"] = str(tt.ttstr(self.getChannelPath(self.current_channel_id)) or "")
@@ -758,12 +824,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             if error or not audio:
                 self._log(f"Synthesis for the web page failed: {error or 'empty audio response'}", "WARNING")
                 return
-            try:
-                temp_path = self._write_temp_audio(extension or "wav", audio)
-            except Exception as exc:
-                self._log(f"Could not write temp audio file: {exc}", "WARNING")
-                return
-            self.actions.put(lambda: self._enqueue_media(temp_path, 0, description))
+            self._prepare_speech(0, description, extension or "wav", audio)
 
         if not self.star_pool.request(voice, text, done):
             raise RuntimeError("no STAR coagulator is connected")
@@ -777,12 +838,8 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         self.pending_channel_join = False
         self.text_parts.clear()
         self.current_media = None
-        while not self.media_queue.empty():
-            try:
-                media_path, _, _ = self.media_queue.get_nowait()
-            except queue.Empty:
-                break
-            self._delete_temp_file(media_path)
+        self._stream_id = 0
+        self._clear_queue()
 
     def _drain_actions(self) -> None:
         while True:
@@ -792,20 +849,23 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
                 return
             action()
 
-    def _shutdown_streaming(self) -> None:
-        try:
-            self.stopStreamingMediaFileToChannel()
-        except Exception:
-            pass
-        if self.current_media:
-            self._delete_temp_file(self.current_media[0])
-            self.current_media = None
+    def _clear_queue(self) -> None:
         while not self.media_queue.empty():
             try:
-                media_path, _, _ = self.media_queue.get_nowait()
+                self.media_queue.get_nowait()
             except queue.Empty:
                 break
-            self._delete_temp_file(media_path)
+
+    def _shutdown_streaming(self) -> None:
+        if self.current_media is not None:
+            # NULL ends the audio input session at once (queued audio is dropped).
+            try:
+                self.insertAudioBlock(None)
+            except Exception:
+                pass
+            self.current_media = None
+            self._stream_id = 0
+        self._clear_queue()
 
     def _user_key(self, user_id: int) -> str:
         user = self.getUser(user_id)
@@ -872,7 +932,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             tt.ttstr(self.server.nickname),
             tt.ttstr(self.server.username),
             tt.ttstr(self.server.password),
-            tt.ttstr(self.global_settings.client_name),
+            tt.ttstr(CLIENT_NAME),
         )
 
     def onConnectFailed(self):
@@ -915,6 +975,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             self.current_channel_id = user.nChannelID
             self.pending_channel_join = False
             self.state = "connected"
+            self.audio_format = self._channel_audio_format(user.nChannelID)
             self._log(f"Joined channel {tt.ttstr(self.getChannelPath(user.nChannelID))}")
             self._start_next_media()
 
@@ -947,22 +1008,97 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             content = str(tt.ttstr(textmessage.szMessage))
         self._handle_private_message(textmessage.nFromUserID, content.strip())
 
-    def onStreamMediaFile(self, mediafileinfo):
-        status = mediafileinfo.nStatus
-        if status == tt.MediaFileStatus.MFS_STARTED:
+    def getMessage(self, nWaitMS: int = -1):
+        # The SDK's runEventLoop does not dispatch CLIENTEVENT_AUDIOINPUT,
+        # so it is picked up here, as each message is read.
+        msg = tt.TeamTalk.getMessage(self, nWaitMS)
+        if msg.nClientEvent == tt.ClientEvent.CLIENTEVENT_AUDIOINPUT:
+            progress = msg.audioinputprogress
+            self._on_audio_input(progress.nStreamID, progress.uQueueMSec, progress.uElapsedMSec)
+        return msg
+
+    def _on_audio_input(self, stream_id: int, queue_msec: int, elapsed_msec: int) -> None:
+        if self.current_media is None or stream_id != self._stream_id:
             return
-        if status not in DONE_MEDIA_STATUSES:
+        if queue_msec == 0 and elapsed_msec == 0:
+            # The session ended: everything was sent.
+            self.current_media = None
+            self._stream_id = 0
+            self._start_next_media()
             return
-        finished = self.current_media
-        self.current_media = None
-        if finished:
-            media_path, requester_id, description = finished
-            self._delete_temp_file(media_path)
-            if status == tt.MediaFileStatus.MFS_ERROR:
-                self._reply(requester_id, f"Streaming failed for {description}.")
-            elif status == tt.MediaFileStatus.MFS_ABORTED:
-                self._reply(requester_id, f"Streaming aborted for {description}.")
+        self._elapsed_msec = max(self._elapsed_msec, elapsed_msec)
+        self._feed_audio()
+
+    def _feed_audio(self) -> None:
+        """Tops up TeamTalk's audio input queue for current_media; when all
+        of it is queued, flushes it with an empty block (which ends the
+        session once the queue has been sent)."""
+        speech = self.current_media
+        if speech is None or self._flushed:
+            return
+        chunk_bytes = speech.frame_bytes * (speech.sample_rate * AUDIO_CHUNK_MSEC // 1000)
+        bytes_per_msec = speech.frame_bytes * speech.sample_rate / 1000
+        while (self._sent_bytes < len(speech.pcm)
+               and self._sent_bytes / bytes_per_msec - self._elapsed_msec < AUDIO_AHEAD_MSEC):
+            piece = speech.pcm[self._sent_bytes:self._sent_bytes + chunk_bytes]
+            buffer = ctypes.create_string_buffer(piece, len(piece))
+            block = tt.AudioBlock()
+            block.nStreamID = self._stream_id
+            block.nSampleRate = speech.sample_rate
+            block.nChannels = speech.channels
+            block.lpRawAudio = ctypes.cast(buffer, ctypes.c_void_p)
+            block.nSamples = len(piece) // speech.frame_bytes
+            block.uSampleIndex = 0
+            block.uStreamTypes = tt.StreamType.STREAMTYPE_VOICE
+            if not self.insertAudioBlock(block):
+                if self._sent_bytes == 0:
+                    self._speech_failed("TeamTalk did not accept the audio. Is the bot allowed to transmit voice in this channel?")
+                return  # the queue is full: more when TeamTalk reports progress
+            self._sent_bytes += len(piece)
+        if self._sent_bytes >= len(speech.pcm):
+            empty = tt.AudioBlock()
+            empty.nStreamID = self._stream_id
+            empty.nSampleRate = speech.sample_rate
+            empty.nChannels = speech.channels
+            empty.lpRawAudio = None
+            empty.nSamples = 0
+            empty.uStreamTypes = tt.StreamType.STREAMTYPE_VOICE
+            self.insertAudioBlock(empty)
+            self._flushed = True
+
+    def _speech_failed(self, reason: str) -> None:
+        speech = self.current_media
+        self._shutdown_current()
+        if speech:
+            self._reply(speech.requester_id, f"Could not speak {speech.description}: {reason}")
+            self._log(f"Could not speak {speech.description}: {reason}", "WARNING")
         self._start_next_media()
+
+    def _shutdown_current(self) -> None:
+        if self.current_media is not None:
+            try:
+                self.insertAudioBlock(None)
+            except Exception:
+                pass
+        self.current_media = None
+        self._stream_id = 0
+
+    def _check_speech_deadline(self) -> None:
+        # A safety net: if TeamTalk never reports the end, move on.
+        if self.current_media is not None and time.monotonic() > self._speech_deadline:
+            self._log(f"Speech did not finish in time; going on: {self.current_media.description}", "WARNING")
+            self._shutdown_current()
+            self._start_next_media()
+
+    def _channel_audio_format(self, channel_id: int) -> tuple[int, int]:
+        codec = self.getChannel(channel_id).audiocodec
+        if codec.nCodec == tt.Codec.OPUS_CODEC and codec.opus.nSampleRate > 0:
+            return codec.opus.nSampleRate, max(1, min(2, codec.opus.nChannels))
+        if codec.nCodec == tt.Codec.SPEEX_CODEC:
+            return (8000, 16000, 32000)[max(0, min(2, codec.speex.nBandmode))], 1
+        if codec.nCodec == tt.Codec.SPEEX_VBR_CODEC:
+            return (8000, 16000, 32000)[max(0, min(2, codec.speex_vbr.nBandmode))], 1
+        return 48000, 1
 
     def _join_configured_channel(self) -> None:
         channel = self.server.channel.strip()
@@ -1198,65 +1334,64 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             if not audio:
                 self._reply(user_id, "Synthesis failed: empty audio response.")
                 return
-            try:
-                temp_path = self._write_temp_audio(extension or "wav", audio)
-            except Exception as exc:
-                self._reply(user_id, f"Could not write temp audio file: {exc}")
-                return
-            self.actions.put(lambda: self._enqueue_media(temp_path, user_id, voice))
+            self._prepare_speech(user_id, voice, extension or "wav", audio)
 
         if not self.star_pool.request(voice_for_request, text, done):
             self._reply(user_id, "No connected STAR coagulator is available.")
 
-    def _write_temp_audio(self, extension: str, audio: bytes) -> Path:
-        extension = "".join(char for char in extension.lower() if char.isalnum()) or "wav"
-        temp_dir = self.bot_settings.temp_dir or None
-        if temp_dir:
-            Path(temp_dir).mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            prefix="star_tt_",
-            suffix=f".{extension}",
-            dir=temp_dir,
-            delete=False,
-        ) as fp:
-            fp.write(audio)
-            return Path(fp.name)
+    def _prepare_speech(self, requester_id: int, description: str, extension: str, audio: bytes) -> None:
+        """Decodes synthesized audio on its own thread (never the TeamTalk or
+        STAR thread), then queues it on the connection's thread."""
+        self._decode_queue.put((requester_id, description, extension, audio))
+        if self._decoder is None or not self._decoder.is_alive():
+            self._decoder = threading.Thread(target=self._decode_worker, name=f"decode:{self.server.name}", daemon=True)
+            self._decoder.start()
 
-    def _enqueue_media(self, path: Path, requester_id: int, description: str) -> None:
+    def _decode_worker(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                requester_id, description, extension, audio = self._decode_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            sample_rate, channels = self.audio_format
+            try:
+                pcm = decode_audio(audio, extension, sample_rate, channels, self.bot_settings.temp_dir)
+            except Exception as exc:
+                self._reply(requester_id, f"Could not decode the synthesized audio: {exc}")
+                self._log(f"Could not decode the synthesized audio for {description}: {exc}", "WARNING")
+                continue
+            pcm += b"\0" * (2 * channels * (sample_rate * SPEECH_TAIL_MSEC // 1000))
+            speech = Speech(pcm, sample_rate, channels, requester_id, description)
+            self.actions.put(lambda speech=speech: self._enqueue_media(speech))
+
+    def _enqueue_media(self, speech: Speech) -> None:
         if not self.in_channel:
-            self._delete_temp_file(path)
             self._reply(
-                requester_id,
-                "Synthesis finished, but the bot is not in a TeamTalk channel to stream it.",
+                speech.requester_id,
+                "Synthesis finished, but the bot is not in a TeamTalk channel to speak it.",
             )
             return
-        self.media_queue.put((path, requester_id, description))
+        self.media_queue.put(speech)
         self._start_next_media()
 
     def _start_next_media(self) -> None:
         if self.current_media or not self.in_channel:
             return
         try:
-            self.current_media = self.media_queue.get_nowait()
+            speech = self.media_queue.get_nowait()
         except queue.Empty:
             return
-        path, requester_id, description = self.current_media
-        if not path.exists():
-            self.current_media = None
-            self._reply(requester_id, f"Temp audio file missing for {description}.")
-            self._start_next_media()
-            return
-        if not self.startStreamingMediaFileToChannel(tt.ttstr(str(path)), None):
-            self.current_media = None
-            self._delete_temp_file(path)
-            self._reply(requester_id, f"Could not start TeamTalk media stream for {description}.")
-            self._start_next_media()
-
-    def _delete_temp_file(self, path: Path) -> None:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception as exc:
-            self._log(f"Could not delete temp file {path}: {exc}", "WARNING")
+        if (speech.sample_rate, speech.channels) != self.audio_format:
+            # The channel changed since it was decoded; TeamTalk resamples.
+            self._log(f"Speech decoded for {speech.sample_rate} Hz/{speech.channels} ch, channel uses "
+                      f"{self.audio_format[0]} Hz/{self.audio_format[1]} ch")
+        self.current_media = speech
+        self._stream_id = next(self._stream_ids)
+        self._sent_bytes = 0
+        self._flushed = False
+        self._elapsed_msec = 0
+        self._speech_deadline = time.monotonic() + speech.seconds + 15
+        self._feed_audio()
 
 
 class ServerError(Exception):
@@ -1426,9 +1561,6 @@ class BotManager:
             for key, value in vars(bot).items():
                 setattr(old.bot, key, value)
             old.teamtalk.reconnect_seconds = teamtalk.reconnect_seconds
-            if teamtalk.client_name != old.teamtalk.client_name:
-                needs_restart.append("the client name (used when each server next logs in)")
-                old.teamtalk.client_name = teamtalk.client_name
             if (teamtalk.license_name, teamtalk.license_key) != (old.teamtalk.license_name, old.teamtalk.license_key):
                 needs_restart.append("the SDK license")
                 old.teamtalk.license_name = teamtalk.license_name

@@ -1,12 +1,19 @@
 # tt-star
 
 A headless TeamTalk user client that turns private messages into speech using
-a STAR coagulator and streams the generated audio into the bot's channel.
+a STAR coagulator and speaks it in the bot's channel.
+
+Speech is sent as the bot's voice stream (TeamTalk's `TT_InsertAudioBlock`),
+like a person talking: it is decoded with ffmpeg to the channel codec's
+sample rate and channels, and listeners set its volume as the bot's voice
+volume. The bot's account needs the right to transmit voice in its channel.
+`tests/audio_smoothness_test.py` measures how it plays at a listener.
 
 ## Requirements
 
 - Python 3.10 or newer
 - A STAR coagulator WebSocket endpoint
+- ffmpeg (to decode the synthesized audio)
 - The separately licensed TeamTalk 5 SDK
 
 Install the Python dependencies:
