@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import re
 import sys
 import tempfile
 import threading
@@ -34,6 +35,12 @@ if str(WORKSPACE_DIR) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_DIR))
 
 from teamtalk_sdk import load_teamtalk_sdk  # noqa: E402
+from botlog import log  # noqa: E402
+
+# Run as a script, this file is __main__; web.py imports it as "bot", which
+# must be this same module (not a second copy with its own SDK and classes).
+if __name__ == "__main__":
+    sys.modules.setdefault("bot", sys.modules[__name__])
 
 tt = load_teamtalk_sdk()
 
@@ -192,30 +199,24 @@ class TeamTalkServerSettings:
 
 
 @dataclass
+class WebSettings:
+    # The management web interface (web.py). It has no password: keep it on
+    # 127.0.0.1 behind a proxy that admits only trusted addresses.
+    enabled: bool = False
+    host: str = "127.0.0.1"
+    port: int = 8776
+
+
+@dataclass
 class AppConfig:
     star: StarSettings
     bot: BotSettings
     teamtalk: TeamTalkGlobalSettings
     servers: list[TeamTalkServerSettings]
+    web: WebSettings = field(default_factory=WebSettings)
 
 
-class RuntimeControl:
-    def __init__(self):
-        self.stop_event = threading.Event()
-        self._restart_requested = False
-        self._lock = threading.Lock()
-
-    def request_stop(self) -> None:
-        self.stop_event.set()
-
-    def request_restart(self) -> None:
-        with self._lock:
-            self._restart_requested = True
-        self.stop_event.set()
-
-    def restart_requested(self) -> bool:
-        with self._lock:
-            return self._restart_requested
+SERVER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")
 
 
 def read_config(path: Path) -> AppConfig:
@@ -225,6 +226,7 @@ def read_config(path: Path) -> AppConfig:
     star_section = parser["star"] if parser.has_section("star") else {}
     bot_section = parser["bot"] if parser.has_section("bot") else {}
     tt_section = parser["teamtalk"] if parser.has_section("teamtalk") else {}
+    web_section = parser["web"] if parser.has_section("web") else {}
 
     star_hosts = parse_list(star_section.get("hosts", "ws://localhost:7774"))
     star = StarSettings(
@@ -272,7 +274,12 @@ def read_config(path: Path) -> AppConfig:
             )
         )
 
-    return AppConfig(star=star, bot=bot, teamtalk=teamtalk, servers=servers)
+    web = WebSettings(
+        enabled=parse_bool(web_section.get("enabled"), False),
+        host=web_section.get("host", "127.0.0.1") or "127.0.0.1",
+        port=int(web_section.get("port", "8776")),
+    )
+    return AppConfig(star=star, bot=bot, teamtalk=teamtalk, servers=servers, web=web)
 
 
 def write_config(path: Path, config: AppConfig) -> None:
@@ -294,6 +301,11 @@ def write_config(path: Path, config: AppConfig) -> None:
         "license_name": config.teamtalk.license_name,
         "license_key": config.teamtalk.license_key,
     }
+    parser["web"] = {
+        "enabled": "yes" if config.web.enabled else "no",
+        "host": config.web.host,
+        "port": str(config.web.port),
+    }
     for server in config.servers:
         parser[f"server:{server.name}"] = {
             "enabled": "yes" if server.enabled else "no",
@@ -308,9 +320,17 @@ def write_config(path: Path, config: AppConfig) -> None:
             "channel_password": server.channel_password,
         }
 
+    # Written beside the old file and moved over it, so a crash never leaves
+    # half a file; readable by its owner only (it holds passwords).
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fp:
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
         parser.write(fp)
+        fp.flush()
+        os.fsync(fp.fileno())
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
 
 
 def configure(path: Path) -> None:
@@ -372,7 +392,7 @@ def configure(path: Path) -> None:
             )
         )
 
-    write_config(path, AppConfig(star=star, bot=bot, teamtalk=teamtalk, servers=servers))
+    write_config(path, AppConfig(star=star, bot=bot, teamtalk=teamtalk, servers=servers, web=existing.web))
     print(f"Configuration written to {path}")
 
 
@@ -422,7 +442,7 @@ class StarConnection(threading.Thread):
                 with connect_star_websocket(self.host) as websocket:
                     self.connected = True
                     websocket.send(json.dumps({"user": USER_REVISION}))
-                    print(f"Connected STAR coagulator {self.display_name}: {self.host}")
+                    log(f"Connected to STAR coagulator {self.display_name}: {self.host}")
                     while not self.stop_event.is_set():
                         self._drain_outbox(websocket)
                         self._expire_pending()
@@ -439,7 +459,7 @@ class StarConnection(threading.Thread):
             except Exception as exc:
                 message = str(exc)
                 if message != last_exception:
-                    print(f"STAR {self.display_name} reconnecting to {self.host!r}: {exc}")
+                    log(f"STAR coagulator {self.display_name} ({self.host}) is not reachable, trying again: {exc}", level="WARNING")
                 last_exception = message
             finally:
                 self.connected = False
@@ -480,12 +500,12 @@ class StarConnection(threading.Thread):
         try:
             payload = json.loads(message)
         except json.JSONDecodeError:
-            print(f"Invalid STAR message from {self.display_name}: {message}")
+            log(f"Invalid message from STAR coagulator {self.display_name}: {message}", level="WARNING")
             return
         if "voices" in payload:
             with self._lock:
                 self.voices = normalize_voices(payload["voices"])
-            print(f"STAR {self.display_name} has {len(self.voices)} voices")
+            log(f"STAR coagulator {self.display_name} has {len(self.voices)} voices")
         elif "status" in payload or "error" in payload or "warning" in payload:
             request_id = normalize_request_id(payload.get("id", ""))
             text = payload.get("status") or payload.get("error") or payload.get("warning")
@@ -493,7 +513,7 @@ class StarConnection(threading.Thread):
                 _, callback, _ = self.pending.pop(request_id)
                 callback(text, None, None)
             else:
-                print(f"STAR {self.display_name}: {text}")
+                log(f"STAR coagulator {self.display_name}: {text}")
 
     def _handle_binary(self, message: bytes) -> None:
         if len(message) < 3:
@@ -550,6 +570,18 @@ class StarPool:
     def connected_count(self) -> int:
         return sum(1 for connection in self.connections if connection.connected)
 
+    def status(self) -> list[dict]:
+        return [
+            {
+                "name": connection.display_name,
+                "host": connection.host,
+                "connected": connection.connected,
+                "voices": len(connection.get_voices()),
+                "pending": len(connection.pending),
+            }
+            for connection in self.connections
+        ]
+
     def request(self, voice: str, text: str, callback: Callable[[str | None, str | None, bytes | None], None]) -> bool:
         lookup_voice = voice.partition("<")[0].strip()
         candidates = [connection for connection in self.connections if connection.has_voice(lookup_voice)]
@@ -568,7 +600,7 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         global_settings: TeamTalkGlobalSettings,
         bot_settings: BotSettings,
         star_pool: StarPool,
-        control: RuntimeControl,
+        manager: "BotManager | None" = None,
     ):
         tt.TeamTalk.__init__(self)
         threading.Thread.__init__(self, name=f"teamtalk:{server.name}", daemon=True)
@@ -576,7 +608,11 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         self.global_settings = global_settings
         self.bot_settings = bot_settings
         self.star_pool = star_pool
-        self.control = control
+        self.manager = manager
+        # What the connection is doing, for the web page: connecting,
+        # logging_in, joining, connected or reconnecting.
+        self.state = "connecting"
+        self.started_at = time.time()
         self.stop_event = threading.Event()
         self.actions: queue.Queue[Callable[[], None]] = queue.Queue()
         self.user_voices: dict[str, str] = {}
@@ -598,11 +634,15 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         self.stop_event.set()
         self.actions.put(lambda: self._shutdown_streaming())
 
+    def _log(self, message: str, level: str = "INFO") -> None:
+        log(message, server=self.server.name, level=level)
+
     def run(self) -> None:
         while not self.stop_event.is_set():
             try:
                 self._reset_runtime()
-                print(f"Connecting TeamTalk {self.server.name}: {self.server.host}:{self.server.tcp_port}")
+                self.state = "connecting"
+                self._log(f"Connecting to {self.server.host}:{self.server.tcp_port}")
                 ok = self.connect(
                     tt.ttstr(self.server.host),
                     self.server.tcp_port,
@@ -610,7 +650,8 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
                     bEncrypted=self.server.encrypted,
                 )
                 if not ok:
-                    print(f"TeamTalk {self.server.name}: connect call failed")
+                    self._log("The connection could not be started", "WARNING")
+                    self.state = "reconnecting"
                     self.stop_event.wait(self.global_settings.reconnect_seconds)
                     continue
                 while not self.stop_event.is_set() and not self.reconnect_now:
@@ -619,9 +660,114 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
                 self._shutdown_streaming()
                 self.disconnect()
             except Exception:
-                traceback.print_exc()
+                self._log(traceback.format_exc().rstrip(), "ERROR")
             if not self.stop_event.is_set():
+                self.state = "reconnecting"
                 self.stop_event.wait(self.global_settings.reconnect_seconds)
+        # Whatever the web page or a command was waiting for is not coming.
+        self._drain_actions()
+
+    def call(self, function: Callable[[], object], timeout: float = 5.0):
+        """Runs `function` on this connection's own thread (where every
+        TeamTalk call and every per-user setting lives) and returns its
+        result. For the web interface."""
+        if threading.current_thread() is self:
+            return function()
+        if not self.is_alive() or self.stop_event.is_set():
+            raise RuntimeError("the bot is not connected to this server")
+        done = threading.Event()
+        result: dict = {}
+
+        def run() -> None:
+            try:
+                result["value"] = function()
+            except Exception as exc:
+                result["error"] = exc
+            finally:
+                done.set()
+
+        self.actions.put(run)
+        if not done.wait(timeout):
+            raise TimeoutError("the connection did not answer in time")
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
+
+    def snapshot(self) -> dict:
+        """What the web page shows about this server (on the connection's
+        thread, through `call`)."""
+        info = {
+            "channel_path": "",
+            "others": [],
+            "queue": self.media_queue.qsize(),
+            "speaking": self.current_media[2] if self.current_media else "",
+        }
+        if self.logged_in and self.current_channel_id > 0:
+            info["channel_path"] = str(tt.ttstr(self.getChannelPath(self.current_channel_id)) or "")
+            names = []
+            for user in self.getChannelUsers(self.current_channel_id):
+                if user.nUserID == self._my_user_id:
+                    continue
+                nickname = str(tt.ttstr(user.szNickname) or "").strip()
+                username = str(tt.ttstr(user.szUsername) or "").strip()
+                names.append(nickname or username or f"user {user.nUserID}")
+            info["others"] = sorted(names, key=str.lower)
+        return info
+
+    def people(self) -> list[dict]:
+        """Each person's choices on this server (voice, rate, pitch, names)."""
+        keys = set(self.user_voices) | set(self.user_rates) | set(self.user_pitches) | self.users_announcing_names
+        return [
+            {
+                "key": key,
+                "voice": self.user_voices.get(key, ""),
+                "rate": self.user_rates.get(key, ""),
+                "pitch": self.user_pitches.get(key, ""),
+                "names": key in self.users_announcing_names,
+            }
+            for key in sorted(keys, key=str.lower)
+        ]
+
+    def forget_person(self, key: str) -> bool:
+        found = any(
+            key in table
+            for table in (self.user_voices, self.user_rates, self.user_pitches, self.users_announcing_names)
+        )
+        self.user_voices.pop(key, None)
+        self.user_rates.pop(key, None)
+        self.user_pitches.pop(key, None)
+        self.users_announcing_names.discard(key)
+        self.user_last_results.pop(key, None)
+        return found
+
+    def stop_speaking(self) -> int:
+        """Stops the current stream and clears the queue; returns how many
+        streams were dropped."""
+        count = self.media_queue.qsize() + (1 if self.current_media else 0)
+        self._shutdown_streaming()
+        return count
+
+    def speak_from_web(self, voice: str, text: str) -> str:
+        """Speaks `text` in the bot's channel with `voice` (the web page's
+        Say something). Runs on the connection's thread."""
+        if not self.in_channel:
+            raise RuntimeError("the bot is not in a channel on this server yet")
+        description = f"{voice} (from the web page)"
+
+        def done(error: str | None, extension: str | None, audio: bytes | None) -> None:
+            if error or not audio:
+                self._log(f"Synthesis for the web page failed: {error or 'empty audio response'}", "WARNING")
+                return
+            try:
+                temp_path = self._write_temp_audio(extension or "wav", audio)
+            except Exception as exc:
+                self._log(f"Could not write temp audio file: {exc}", "WARNING")
+                return
+            self.actions.put(lambda: self._enqueue_media(temp_path, 0, description))
+
+        if not self.star_pool.request(voice, text, done):
+            raise RuntimeError("no STAR coagulator is connected")
+        return f"Synthesizing with {voice}. It plays in {self.server.channel or 'the channel'} when it is ready."
 
     def _reset_runtime(self) -> None:
         self.reconnect_now = False
@@ -687,6 +833,10 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         return False
 
     def _reply(self, user_id: int, content: str) -> None:
+        if user_id <= 0:
+            # A request from the web page: there is no one to message.
+            self._log(content)
+            return
         if threading.current_thread() is not self:
             self.actions.put(lambda: self._reply(user_id, content))
             return
@@ -711,12 +861,13 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             f"{p}current - show your chosen voice\n"
             f"{p}status - show bot status\n"
             f"{p}stop - stop current stream and clear this server's queue\n"
-            f"{p}restart - restart the bot process\n"
-            f"{p}quit - shut down the bot process\n"
+            f"{p}restart - reconnect the bot to this server, with its settings read again\n"
+            f"{p}quit - disconnect the bot from this server until the bot is restarted\n"
             f"Any private message without {p} is spoken with your chosen voice."
         )
 
     def onConnectSuccess(self):
+        self.state = "logging_in"
         self.doLogin(
             tt.ttstr(self.server.nickname),
             tt.ttstr(self.server.username),
@@ -725,27 +876,29 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         )
 
     def onConnectFailed(self):
-        print(f"TeamTalk {self.server.name}: connection failed")
+        self._log("Connection failed", "WARNING")
         self.reconnect_now = True
 
     def onConnectCryptError(self, clienterrormsg):
-        print(f"TeamTalk {self.server.name}: encryption error {clienterrormsg.szErrorMsg}")
+        self._log(f"Encryption error: {tt.ttstr(clienterrormsg.szErrorMsg)}", "WARNING")
         self.reconnect_now = True
 
     def onConnectionLost(self):
-        print(f"TeamTalk {self.server.name}: connection lost")
+        self._log("Connection lost", "WARNING")
         self.reconnect_now = True
 
     def onCmdError(self, cmdId: int, errmsg):
-        print(f"TeamTalk {self.server.name}: command {cmdId} error {errmsg.nErrorNo}: {tt.ttstr(errmsg.szErrorMsg)}")
+        self._log(f"Command {cmdId} failed with error {errmsg.nErrorNo}: {tt.ttstr(errmsg.szErrorMsg)}", "WARNING")
 
     def onCmdMyselfLoggedIn(self, userid: int, useraccount):
         self.logged_in = True
         self._my_user_id = userid
-        print(f"TeamTalk {self.server.name}: logged in as user {userid}")
+        self.state = "joining"
+        self._log(f"Logged in as user {userid}")
         self._join_configured_channel()
 
     def onCmdMyselfLoggedOut(self):
+        self.state = "reconnecting"
         self.logged_in = False
         self.in_channel = False
         self.current_channel_id = 0
@@ -753,25 +906,29 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
     def onCmdMyselfKickedFromChannel(self, channelid: int, user):
         self.in_channel = False
         self.current_channel_id = 0
-        print(f"TeamTalk {self.server.name}: kicked from channel {channelid}")
+        self.state = "joining"
+        self._log(f"Kicked from channel {channelid}", "WARNING")
 
     def onCmdUserJoinedChannel(self, user):
         if user.nUserID == self._my_user_id:
             self.in_channel = True
             self.current_channel_id = user.nChannelID
             self.pending_channel_join = False
-            print(f"TeamTalk {self.server.name}: joined channel {user.nChannelID}")
+            self.state = "connected"
+            self._log(f"Joined channel {tt.ttstr(self.getChannelPath(user.nChannelID))}")
             self._start_next_media()
 
     def onCmdUserLeftChannel(self, channelid: int, user):
         if user.nUserID == self._my_user_id:
             self.in_channel = False
             self.current_channel_id = 0
+            self.state = "joining"
 
     def onCmdUserUpdate(self, user):
         if user.nUserID == self._my_user_id:
             self.in_channel = user.nChannelID > 0
             self.current_channel_id = user.nChannelID
+            self.state = "connected" if self.in_channel else "joining"
 
     def onCmdUserTextMessage(self, textmessage):
         if textmessage.nMsgType != tt.TextMsgType.MSGTYPE_USER:
@@ -813,7 +970,8 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             return
         channel_id = self.getRootChannelID() if channel == "/" else self.getChannelIDFromPath(tt.ttstr(channel))
         if channel_id <= 0:
-            print(f"TeamTalk {self.server.name}: channel not found: {channel}")
+            self._log(f"Channel not found: {channel}", "WARNING")
+            self.state = "no_channel"
             return
         self.pending_channel_join = True
         self.doJoinChannelByID(channel_id, tt.ttstr(self.server.channel_password))
@@ -868,11 +1026,21 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             self._shutdown_streaming()
             self._reply(user_id, "Stopped streaming and cleared this server's queue.")
         elif command in {"quit", "exit", "shutdown"}:
-            self._reply(user_id, "Shutting down.")
-            self.control.request_stop()
+            # Only this server: the other servers keep running. Restarting
+            # the whole bot is done with startman or on the web page.
+            self._reply(user_id, "Disconnecting from this server until the bot is restarted.")
+            self._log(f"/quit from {self._user_display_name(user_id)}: disconnecting from this server")
+            if self.manager:
+                self.manager.stop_server(self.server.name, reason="disconnected by /quit")
+            else:
+                self.stop()
         elif command == "restart":
-            self._reply(user_id, "Restarting.")
-            self.control.request_restart()
+            self._reply(user_id, "Reconnecting to this server.")
+            self._log(f"/restart from {self._user_display_name(user_id)}: reconnecting to this server")
+            if self.manager:
+                self.manager.restart_server(self.server.name)
+            else:
+                self.reconnect_now = True
         else:
             self._reply(user_id, f"Unknown command. Send {self.bot_settings.command_prefix}help for commands.")
 
@@ -1088,49 +1256,261 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
         try:
             path.unlink(missing_ok=True)
         except Exception as exc:
-            print(f"Could not delete temp file {path}: {exc}")
+            self._log(f"Could not delete temp file {path}: {exc}", "WARNING")
+
+
+class ServerError(Exception):
+    """A change to the servers that cannot be made (shown to the user)."""
+
+
+class BotManager:
+    """Runs one connection per enabled server and changes them while the bot
+    runs: the web interface, /restart and /quit go through here, so a
+    change to one server never touches the others."""
+
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.config = read_config(config_path)
+        self._lock = threading.RLock()
+        self.connections: dict[str, TeamTalkBotConnection] = {}
+        # Why an enabled server is not running (e.g. "disconnected by /quit").
+        self.not_running: dict[str, str] = {}
+        self.stop_event = threading.Event()
+        self.restart_requested = False
+        self.process_started_at = time.time()
+        if self.config.teamtalk.license_name or self.config.teamtalk.license_key:
+            tt.setLicense(tt.ttstr(self.config.teamtalk.license_name), tt.ttstr(self.config.teamtalk.license_key))
+        self.star_pool = StarPool(self.config.star)
+        self.star_pool.start()
+
+    # ------------------------------------------------------------ servers
+
+    def server(self, name: str) -> TeamTalkServerSettings:
+        for server in self.config.servers:
+            if server.name == name:
+                return server
+        raise ServerError(f"There is no server named {name}.")
+
+    def start_all(self) -> None:
+        for server in self.config.servers:
+            if server.enabled:
+                self.start_server(server.name)
+
+    def start_server(self, name: str) -> bool:
+        with self._lock:
+            server = self.server(name)
+            if name in self.connections:
+                return True
+            if not server.enabled:
+                return False
+            connection = TeamTalkBotConnection(server, self.config.teamtalk, self.config.bot, self.star_pool, self)
+            self.connections[name] = connection
+            self.not_running.pop(name, None)
+            connection.start()
+            return True
+
+    def _stop(self, name: str, reason: str = "") -> None:
+        with self._lock:
+            connection = self.connections.pop(name, None)
+            if reason:
+                self.not_running[name] = reason
+        if connection is not None:
+            connection.stop()
+            if connection is not threading.current_thread():
+                connection.join(timeout=10)
+            log("Disconnected", server=name)
+
+    def stop_server(self, name: str, reason: str = "", delay: float = 0.5) -> None:
+        """Disconnects one server in the background (a command can stop its
+        own connection); `delay` lets a reply reach the user first."""
+
+        def run() -> None:
+            time.sleep(delay)
+            self._stop(name, reason)
+
+        threading.Thread(target=run, name=f"stop:{name}", daemon=True).start()
+
+    def restart_server(self, name: str, delay: float = 0.5) -> None:
+        """Reconnects one server in the background, its settings read again
+        from the configuration file."""
+
+        def run() -> None:
+            time.sleep(delay)
+            try:
+                self.reload_and_restart(name)
+            except ServerError as exc:
+                log(f"Not reconnected: {exc}", server=name, level="WARNING")
+
+        threading.Thread(target=run, name=f"restart:{name}", daemon=True).start()
+
+    def reload_and_restart(self, name: str) -> bool:
+        self._stop(name)
+        with self._lock:
+            try:
+                fresh = read_config(self.config_path)
+            except (configparser.Error, ValueError) as exc:
+                self.not_running[name] = f"the configuration file could not be read: {exc}"
+                raise ServerError(f"The configuration file could not be read: {exc}")
+            replacement = next((s for s in fresh.servers if s.name == name), None)
+            if replacement is None:
+                raise ServerError(f"{name} is no longer in the configuration file.")
+            self.config.servers = [replacement if s.name == name else s for s in self.config.servers]
+            return self.start_server(name)
+
+    def _validate(self, settings: TeamTalkServerSettings) -> None:
+        if not SERVER_NAME.match(settings.name):
+            raise ServerError(
+                "The server name may use letters, numbers, dots, dashes and underscores, "
+                "starting with a letter or number, at most 40 characters."
+            )
+        if not settings.host.strip():
+            raise ServerError("Fill in the server address.")
+        for label, port in (("TCP port", settings.tcp_port), ("UDP port", settings.udp_port)):
+            if not 1 <= port <= 65535:
+                raise ServerError(f"The {label} must be between 1 and 65535.")
+        if not settings.nickname.strip():
+            raise ServerError("Fill in the bot's nickname.")
+
+    def add_server(self, settings: TeamTalkServerSettings) -> bool:
+        self._validate(settings)
+        with self._lock:
+            if any(s.name == settings.name for s in self.config.servers):
+                raise ServerError(f"There is already a server named {settings.name}.")
+            self.config.servers.append(settings)
+            self.save()
+            log(f"Server added ({settings.host}:{settings.tcp_port})", server=settings.name)
+            return self.start_server(settings.name) if settings.enabled else False
+
+    def update_server(self, name: str, settings: TeamTalkServerSettings) -> bool:
+        settings.name = name
+        self._validate(settings)
+        self._stop(name)
+        with self._lock:
+            self.server(name)
+            self.config.servers = [settings if s.name == name else s for s in self.config.servers]
+            self.save()
+            log("Settings changed", server=name)
+            return self.start_server(name) if settings.enabled else False
+
+    def remove_server(self, name: str) -> None:
+        self.server(name)
+        self._stop(name)
+        with self._lock:
+            self.config.servers = [s for s in self.config.servers if s.name != name]
+            self.not_running.pop(name, None)
+            self.save()
+        log("Server removed", server=name)
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        with self._lock:
+            server = self.server(name)
+            server.enabled = enabled
+            self.save()
+        if enabled:
+            log("Turned on", server=name)
+            return self.start_server(name)
+        self._stop(name)
+        self.not_running.pop(name, None)
+        log("Turned off", server=name)
+        return False
+
+    # ----------------------------------------------------------- settings
+
+    def update_settings(self, star: StarSettings, bot: BotSettings, teamtalk: TeamTalkGlobalSettings) -> list[str]:
+        """Applies the bot-wide settings; returns what still needs a restart
+        of the whole bot."""
+        needs_restart = []
+        with self._lock:
+            old = self.config
+            # Shared objects: every connection sees these at once.
+            for key, value in vars(bot).items():
+                setattr(old.bot, key, value)
+            old.teamtalk.reconnect_seconds = teamtalk.reconnect_seconds
+            if teamtalk.client_name != old.teamtalk.client_name:
+                needs_restart.append("the client name (used when each server next logs in)")
+                old.teamtalk.client_name = teamtalk.client_name
+            if (teamtalk.license_name, teamtalk.license_key) != (old.teamtalk.license_name, old.teamtalk.license_key):
+                needs_restart.append("the SDK license")
+                old.teamtalk.license_name = teamtalk.license_name
+                old.teamtalk.license_key = teamtalk.license_key
+            if (star.hosts, star.request_timeout) != (old.star.hosts, old.star.request_timeout):
+                self._replace_star_pool(star)
+            self.save()
+        log("Bot settings changed")
+        return needs_restart
+
+    def _replace_star_pool(self, star: StarSettings) -> None:
+        old_pool = self.star_pool
+        self.config.star = star
+        self.star_pool = StarPool(star)
+        self.star_pool.start()
+        for connection in list(self.connections.values()):
+            connection.star_pool = self.star_pool
+        old_pool.stop()
+        log("STAR coagulators changed: " + ", ".join(star.hosts))
+
+    def save(self) -> None:
+        write_config(self.config_path, self.config)
+
+    # ------------------------------------------------------------ process
+
+    def restart_process(self) -> None:
+        """Restarts the whole bot (every server reconnects)."""
+        self.restart_requested = True
+        self.stop_event.set()
+
+    def close(self) -> None:
+        with self._lock:
+            names = list(self.connections)
+        for connection in [self.connections.get(name) for name in names]:
+            if connection is not None:
+                connection.stop()
+        for name in names:
+            connection = self.connections.pop(name, None)
+            if connection is not None:
+                connection.join(timeout=5)
+        self.star_pool.stop()
+        self.star_pool.join(timeout=2)
 
 
 def run_bot(config_path: Path) -> int:
-    config = read_config(config_path)
-    if not config.servers:
+    manager = BotManager(config_path)
+    config = manager.config
+    if not config.servers and not config.web.enabled:
         print(f"No TeamTalk servers are configured in {config_path}. Run with --configure first.")
+        manager.close()
         return 2
-
-    if config.teamtalk.license_name or config.teamtalk.license_key:
-        tt.setLicense(tt.ttstr(config.teamtalk.license_name), tt.ttstr(config.teamtalk.license_key))
-
-    star_pool = StarPool(config.star)
-    star_pool.start()
-    control = RuntimeControl()
-
-    connections = [
-        TeamTalkBotConnection(server, config.teamtalk, config.bot, star_pool, control)
-        for server in config.servers
-        if server.enabled
-    ]
-    if not connections:
+    if not any(server.enabled for server in config.servers) and not config.web.enabled:
         print("All TeamTalk server sections are disabled.")
-        star_pool.stop()
+        manager.close()
         return 2
 
-    for connection in connections:
-        connection.start()
+    web = None
+    if config.web.enabled:
+        import web as web_interface
 
-    print("STAR TeamTalk bot is running. Press Ctrl+C to stop.")
+        try:
+            web = web_interface.WebInterface(manager, config.web.host, config.web.port)
+            web.start()
+        except OSError as exc:
+            log(f"The web interface could not start on {config.web.host}:{config.web.port}: {exc}", level="ERROR")
+            web = None
+
+    manager.start_all()
+    log("STAR TeamTalk bot is running. Press Ctrl+C to stop.")
     try:
-        while not control.stop_event.wait(1):
+        while not manager.stop_event.wait(1):
             pass
     except KeyboardInterrupt:
-        print("Stopping...")
+        log("Stopping...")
     finally:
-        for connection in connections:
-            connection.stop()
-        star_pool.stop()
-        for connection in connections:
-            connection.join(timeout=5)
-        star_pool.join(timeout=2)
-    return EXIT_RESTART if control.restart_requested() else 0
+        if web is not None:
+            web.close()
+        manager.close()
+    if manager.restart_requested:
+        log("Restarting the bot process")
+        return EXIT_RESTART
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:

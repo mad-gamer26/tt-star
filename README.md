@@ -32,6 +32,49 @@ python bot.py --config ~/.config/tt-star/config.ini
 On Windows, use a path such as
 `%LOCALAPPDATA%\tt-star\config.ini` instead.
 
+## Chat commands
+
+Send the bot a private message. Anything that is not a command is spoken in
+the bot's channel with your chosen voice. `help` lists the commands. Two of
+them affect only the server they are sent on; the bot stays connected to
+every other server:
+
+- `restart` reconnects the bot to this server, with its settings read again
+  from the configuration file.
+- `quit` disconnects the bot from this server until the bot is restarted (or
+  it is connected again on the web page).
+
+Restart the whole bot with your service manager or on the web page.
+
+## Web interface
+
+The bot can serve a management page from inside its own process: every
+server's state, who is in its channel and what is being spoken; turning
+servers on and off, reconnecting and disconnecting them; adding servers
+(paste a `tt://` link to fill in the form), editing and removing them, all
+while the other servers keep running; speaking text in a channel; each
+person's voice, rate and pitch choices; the voices on offer; the bot-wide
+settings; the log; and restarting the bot. Turn it on in the configuration:
+
+```ini
+[web]
+enabled = yes
+host = 127.0.0.1
+port = 8776
+```
+
+It has **no password**. Keep it on 127.0.0.1 and put a reverse proxy in front
+of it that admits only trusted addresses (for example only your Tailscale
+network). The proxy must pass the `Host` header with its port, because
+changes are refused when their `Origin` does not match it. Changes also need
+the `X-STAR-Request` header, which other sites cannot send.
+
+Changes made on the page are written to the configuration file (readable by
+its owner only, since it holds passwords).
+
+`tests/live_web_test.py` tests the commands and the page end to end against
+two throwaway TeamTalk servers and a STAR coagulator; see its docstring.
+
 ## TeamTalk SDK setup
 
 If TeamTalk is already importable, the bot uses that installation. You can
@@ -55,7 +98,8 @@ own SDK entitlement. See [THIRD_PARTY.md](THIRD_PARTY.md).
 Private messages sent to the bot are forwarded to the configured STAR server
 for synthesis. Use `wss://` for non-local endpoints and do not commit a live
 configuration file. At present, run the bot only on a trusted TeamTalk server:
-administrative chat commands are not yet restricted to an operator allowlist.
+administrative chat commands are not yet restricted to an operator allowlist
+(`restart` and `quit` affect only the server they are sent on).
 
 ## License
 
