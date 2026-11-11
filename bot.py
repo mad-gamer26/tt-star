@@ -767,7 +767,14 @@ class TeamTalkBotConnection(tt.TeamTalk, threading.Thread):
             "others": [],
             "queue": self.media_queue.qsize(),
             "speaking": self.current_media.description if self.current_media else "",
+            "can_speak": None,
         }
+        if self.logged_in:
+            # Speech is the bot's voice stream: its account needs the right
+            # to transmit voice (administrators have every right).
+            account = self.getMyUserAccount()
+            info["can_speak"] = bool(account.uUserType & tt.UserType.USERTYPE_ADMIN
+                                     or account.uUserRights & tt.UserRight.USERRIGHT_TRANSMIT_VOICE)
         if self.logged_in and self.current_channel_id > 0:
             info["channel_path"] = str(tt.ttstr(self.getChannelPath(self.current_channel_id)) or "")
             names = []

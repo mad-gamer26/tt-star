@@ -67,6 +67,7 @@ def server_status(manager: star_bot.BotManager, server: star_bot.TeamTalkServerS
         "others": None,
         "queue": 0,
         "speaking": "",
+        "can_speak": None,
     }
     if connection is None:
         if not server.enabled:

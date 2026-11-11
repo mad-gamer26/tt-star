@@ -203,6 +203,8 @@ def main() -> int:
             lambda: all(s["state"] == "connected" for s in state()["servers"]), 30), state())
         check("the STAR coagulator is connected and has voices", wait_for(
             lambda: state()["star"]["voices"] > 0, 30), state()["star"])
+        check("the page says the bot may speak (transmit voice) on both", wait_for(
+            lambda: all(s["can_speak"] is True for s in state()["servers"]), 10), [s["can_speak"] for s in state()["servers"]])
         pid = bot.pid
         started = state()["process"]["started_at"]
 

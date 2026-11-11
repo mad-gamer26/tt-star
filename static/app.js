@@ -612,7 +612,7 @@ async function showServer(name) {
   const statusList = el("dl", { class: "status-list" });
   const statusItems = [
     ["state", "State"], ["host", "Address"], ["nickname", "Nickname"], ["account", "Account"],
-    ["channel", "Channel"], ["others", "Others in the channel"], ["speaking", "Speaking now"], ["since", "Connected since"],
+    ["channel", "Channel"], ["others", "Others in the channel"], ["speaking", "Speaking now"], ["can-speak", "Allowed to speak"], ["since", "Connected since"],
   ];
   for (const [key, label] of statusItems) statusList.append(el("dt", { text: label }), el("dd", { id: "status-" + key }));
   const toggleButton = el("button", { type: "button", id: "toggle" });
@@ -631,6 +631,7 @@ async function showServer(name) {
     setText("status-channel", status.channel_path || status.channel);
     setText("status-others", othersText(status));
     setText("status-speaking", speakingText(status));
+    setText("status-can-speak", status.can_speak === null ? "" : status.can_speak ? "Yes" : "No: the bot's account may not transmit voice on this server, so no one hears its speech");
     setText("status-since", status.started_at ? formatTime(status.started_at) : "");
     const toggleText = status.enabled ? "Turn off" : "Turn on";
     if (toggleButton.textContent !== toggleText) toggleButton.textContent = toggleText;
